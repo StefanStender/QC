@@ -1,0 +1,167 @@
+---
+output: pdf_document
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{sectsty} \sectionfont{\centering}
+---
+
+
+```{r Multiple Plots in a loop, echo=FALSE, message = FALSE, results='asis', warning=FALSE, fig.keep="all"}
+
+library(ggplot2)
+library(data.table)
+library(bit64)
+library(pander)
+library(tidyverse)
+library(tinytex)
+library(kableExtra)
+library(formattable)
+
+#load cvmax-file
+cvmax <- fread("C:/Users/sste0018/Documents/R/KBA/Cobas/cvmax.csv")
+
+#load QC-results
+db <- fread('C:/Users/sste0018/Documents/R/KBA/Cobas/qc_output_sampledata.csv')
+
+#merge, clean, and make  new variables needed for loop
+cobasanalyser <- intersect(unique(db$Test), sort(unique(cvmax$Analyse)))
+db <- setDT(db, key = 'Test')[J(cobasanalyser), nomatch = 0] # Only keep cobas-analyser
+db[, Control:=gsub("[[:space:]]", "", Control)] 
+db[, Test:=as.character(Test)] # sodium is read as missing (NA). ensures it's read as char.
+db <- db[Review!='Rejected']
+tests_to_analyze <- sort(unique(db$Test))
+db <- db[!is.na(as.numeric(Result, na.rm=T)), ]
+db[, Date:=as.Date(Date, format="%d/%m/%Y")]
+db[ , cobas:=sub('(^C8000_\\d).*', '\\1', Instrument)]
+setnames(db, old='Target value', new='target')
+setnames(db, old='Control lot', new='control_lot')
+setnames(db, old='R1 lot', new='R1_lot')
+db[, Result:=as.numeric(Result)]
+instruments <- unique(db$Instrument)
+
+#loop for plots and tables
+for(i in seq_along(tests_to_analyze)) {
+  current_db <- db[Test==tests_to_analyze[i]]
+  currenttest <- current_db$Test[1]
+  SDs <- current_db[, unique(SD)]
+  targets <- current_db[, unique(target)]
+
+  cv <- current_db[ , sd(Result, na.rm=T)/mean(Result, na.rm=T)*100, .(Instrument, Control)]
+  changed_control <- unlist(current_db[ , (length(unique(control_lot))), by=Control][V1>1, 1]) # extract name(s) of control(s) that lot change affects
+  changed_control_test <- length(changed_control)>0
+  
+  changed_R1 <- unlist(current_db[ , (length(unique(R1_lot))), by=Instrument][V1>1, 1]) # extract name(s) of R1 that change affects
+  changed_R1_test <- length(changed_R1)>0
+ 
+  skiftR1extract <- current_db[, .SD[unique(c(1,.N))], by=.(R1_lot, Instrument)][, min(Date), .(R1_lot, Instrument)]
+  skiftR1extract <- skiftR1extract[, .(max(V1)), Instrument]
+  
+  minicontroldb <- current_db[ , .(target=unique(target),
+                                 SD=unique(SD[1]),
+                                 yposforlotchange_above=unique(target[1]+3*SD[1]),
+                                 yposforR1change_above=unique(target[1]+2.5*SD[1]),
+                                 nR1lotsinperiod=length(unique(R1_lot)),
+                                 nlotsinperiod=length(unique(control_lot))), .(Instrument, Control)]
+  
+  minicontroldb[skiftR1extract, on='Instrument', skiftR1dato:=i.V1]
+  minicontroldb[nR1lotsinperiod<2, skiftR1dato:=NA, by=Instrument]
+  
+  minicontroldb <- minicontroldb[(current_db[, .SD[unique(c(1,.N))], by=control_lot]
+                                  [, min(Date), .(control_lot, Control)]
+                                  [, .(skiftdato=max(V1)), Control]), on='Control']
+  
+  minicontroldb[!(Control %in% changed_control), skiftdato:=NA]
+  minicontroldb[, yposforlotchange_above:=yposforlotchange_above[1], Control]
+
+  pander::pandoc.header(current_db$Test[1], level = 1)
+  
+  cat("\n\n")
+  cat("\n\n")
+  
+ 
+Control_levels <- current_db[, target[1], Control][order(-V1), V1] # sorter høj til lav kontrol
+Control_levels <- current_db[, .(SD=SD[1], target=target[1]), Control][order(-target), ] # sorter høj til lav kontrol
+
+Control_names <- current_db[, target[1], Control][order(-V1), Control] # sorter høj til lav kontrol
+current_db$Control <- factor(current_db$Control, levels = c(Control_names)) # sikrer at høj kontrol er level 1 osv
+
+Control_cvmax <- cvmax[Analyse==currenttest, .(Control, INTERN)]
+Control_levels[Control_cvmax, on='Control', cvmaxkontrol:=i.INTERN ]
+Control_levels[, cvmaxkontrol:=(nafill(as.numeric(cvmaxkontrol), 'nocb'))]
+Control_levels[, cvmaxkontrol:=(nafill(as.numeric(cvmaxkontrol), 'locf'))]
+antalkontroller <- length(unique(current_db$Control))
+minicontroldb$Control <- factor(minicontroldb$Control, levels = c(Control_names)) # sikrer at høj kontrol er level 1 osv
+
+#define colors for plotdata, target , 1SD, and 2SD
+my_colors <- c(scales::hue_pal()(length(unique(current_db$Instrument))), 'black', 'grey', 'skyblue')
+names(my_colors) <- c(unique(current_db$Instrument), 'black', 'grey', 'skyblue') 
+
+  p <- ggplot(current_db, aes(x=Date, y=as.numeric(Result), color=Instrument, group=interaction(Instrument, Control))) +
+  geom_line(data=current_db, aes(x=Date, y=as.numeric(target), color='black'), size=1.2) +
+  geom_line(data=current_db, aes(x=Date, y=as.numeric(target+SD), color='grey'), size=1) +
+  geom_line(data=current_db, aes(x=Date, y=as.numeric(target-SD), color='grey'), size=1) +
+  geom_line(data=current_db, aes(x=Date, y=as.numeric(target+2*SD), color='skyblue'), size=1.2) +
+  geom_line(data=current_db, aes(x=Date, y=as.numeric(target-2*SD), color='skyblue'), size=1.2) +
+  geom_point(size=2) +
+  geom_line() +
+  ylab(paste0(current_db$Test[1], ' ', '(', current_db$Unit[1], ')')) +
+  {if(changed_control_test)geom_point(data=minicontroldb, aes(x=skiftdato, y=yposforlotchange_above), size=3, shape=25, color='black', fill='black') } +
+  {if(changed_R1_test)geom_point(data=minicontroldb, aes(x=skiftR1dato, y=yposforR1change_above), size=2, shape=8, color='black', fill='black') } +
+  scale_color_manual(
+    values = my_colors,
+    breaks = c(unique(current_db$Instrument))) +
+
+  facet_grid(Control ~ Instrument, scales = "free") +
+  theme(legend.position="bottom") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  theme(legend.position = "none")
+
+print(p)  
+
+cat("  \n")  
+  cat("  \n") 
+  
+cobas2_master <- current_db[grep('^C8000_2.*\\d$', Instrument)][[1]][1] # first canal for cobas 2
+cobas3_master <- current_db[grep('^C8000_3.*(1|2|5)$', Instrument)][[1]][1] # master is first canal for cobas 3
+mastercobas <-   {ifelse(!is.na(cobas2_master), cobas2_master, cobas3_master)} # cobas_2 if analyzed on 1 or 2, cobas_3 otherwise
+mastercobas <- {ifelse(mastercobas=='C8000_2 - 2_ISE_2', 'C8000_2 - 2_ISE_1', mastercobas)}
+  mastermeans <- current_db[, .(Mean=mean(Result, na.rm=T),
+                              'CV(%)'=sd(Result)/mean(Result)*100,
+                              SD=sd(Result, na.rm=T)), .(Instrument, Control)][order(Instrument, Control)]
+
+  mastermeans[Control_levels, on='Control', kontrolSD:=i.SD ]
+  mastermeans[Control_levels, on='Control', CVmax:=as.numeric(i.cvmaxkontrol)]
+
+mastermeans[, Abs_Diff:=(Mean[Instrument==mastercobas]-Mean), Control]
+mastermeans[, Diff_SD:=Abs_Diff/kontrolSD]
+mastermeans[`CV(%)`==0, Diff_SD:=0]
+
+cols=colnames(mastermeans)[3:9]
+mastermeans[, (cols) := lapply(.SD, round,2), .SDcols = cols] 
+
+dt <- mastermeans[, -(5:6)]
+
+tableforpdf <- dt %>%
+  kbl() %>%
+  kable_styling("striped", full_width = F, position = "left") %>%
+  column_spec(7, background = ifelse(abs(dt$Diff_SD) > 1.5, "red", 'white')) %>%
+  column_spec(7, color = ifelse(abs(dt$Diff_SD) > 1.5, "white", 'black')) %>%
+  column_spec(7, bold = ifelse(abs(dt$Diff_SD) > 1.5, "T", 'F')) %>% 
+  column_spec(4, background = ifelse(dt$'CV(%)' > dt$CVmax, "red", 'white')) %>%
+  column_spec(4, color = ifelse(dt$'CV(%)' > dt$CVmax, "white", 'black')) %>%
+  column_spec(4, bold = ifelse(dt$'CV(%)' > dt$CVmax, "T", 'F')) %>%  
+  row_spec(which(dt$Instrument==mastercobas), background = '#CCFFCC') %>%
+  
+  row_spec(0, bold=T, background = "#D3D3D3")
+
+ print(tableforpdf)
+
+  cat("  \n")  
+  cat("  \n")
+  #pander::pandoc.header(paste('CVmax=', cvmaxcurrent, '%'), level = 3)
+  cat("  \n")  
+  cat("  \n") 
+  cat('\\pagebreak')
+}
+```
+  
