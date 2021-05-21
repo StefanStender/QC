@@ -1,0 +1,116 @@
+---
+output: pdf_document
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{sectsty} \sectionfont{\centering}
+---
+
+
+```{r summary table, echo=FALSE, message = FALSE, results='asis', warning=FALSE, fig.keep="all"}
+
+library(ggplot2)
+library(data.table)
+library(bit64)
+library(pander)
+library(tidyverse)
+library(tinytex)
+library(kableExtra)
+library(formattable)
+
+#load cvmax-file
+cvmax <- fread("C:/Users/sste0018/Documents/R/KBA/Cobas/cvmax.csv")
+
+#load QC-results
+db <- fread('C:/Users/sste0018/Documents/R/KBA/Cobas/qc_output_sampledata.csv')
+
+#merge, clean, and make  new variables needed for loop
+cobasanalyser <- intersect(unique(db$Test), sort(unique(cvmax$Analyse)))
+db <- setDT(db, key = 'Test')[J(cobasanalyser), nomatch = 0] # Only keep cobas-analyser
+db[, Control:=gsub("[[:space:]]", "", Control)] 
+db[, Test:=as.character(Test)] # sodium is read as missing (NA). ensures it's read as char.
+db <- db[Review!='Rejected']
+tests_to_analyze <- sort(unique(db$Test))
+db <- db[!is.na(as.numeric(Result, na.rm=T)), ]
+db[, Date:=as.Date(Date, format="%d/%m/%Y")]
+db[ , cobas:=sub('(^C8000_\\d).*', '\\1', Instrument)]
+setnames(db, old='Target value', new='target')
+setnames(db, old='Control lot', new='control_lot')
+setnames(db, old='R1 lot', new='R1_lot')
+db[, Result:=as.numeric(Result)]
+instruments <- unique(db$Instrument)
+
+for(i in seq_along(tests_to_analyze)) {
+  
+  current_db <- db[Test==tests_to_analyze[i]]
+  current_db[, Control:=gsub("[[:space:]]", "", Control)]
+  currenttest <- current_db$Test[1]
+  SDs <- current_db[, unique(SD)]
+  targets <- current_db[, unique(target)]
+  cv <- current_db[ , sd(Result, na.rm=T)/mean(Result, na.rm=T)*100, .(Instrument, Control)]
+  Control_levels <- current_db[, target[1], Control][order(-V1), V1] # sorter høj til lav kontrol
+  Control_levels <- current_db[, .(SD=SD[1], target=target[1]), Control][order(-target), ] # sorter høj til lav kontrol
+  Control_levels$Control <- gsub("[[:space:]]", "", Control_levels$Control)
+  Control_names <- current_db[, target[1], Control][order(-V1), Control] # sorter høj til lav kontrol
+  current_db$Control <- factor(current_db$Control, levels = c(Control_names)) # sikrer at høj kontrol er level 1 osv
+  Control_cvmax <- cvmax[Analyse==currenttest, .(Control, INTERN)]
+  Control_levels[Control_cvmax, on='Control', cvmaxkontrol:=i.INTERN ]
+  Control_levels[, cvmaxkontrol:=(nafill(as.numeric(cvmaxkontrol), 'nocb'))]
+  Control_levels[, cvmaxkontrol:=(nafill(as.numeric(cvmaxkontrol), 'locf'))]
+  antalkontroller <- length(unique(current_db$Control))
+  cvmaxcurrent <- as.numeric(cvmax[Analyse==currenttest, INTERN][1])
+
+
+  cobas2_master <- current_db[grep('^C8000_2.*\\d$', Instrument)][[1]][1] # master is first canal for cobas 2
+  cobas3_master <- current_db[grep('^C8000_3.*(1|2|5)$', Instrument)][[1]][1] # master is first canal for cobas 3
+  mastercobas <-   {ifelse(!is.na(cobas2_master), cobas2_master, cobas3_master)} # master is cobas_2 if analyzed on 1 or 2, cobas_3 otherwise
+ mastercobas <- {ifelse(mastercobas=='C8000_2 - 2_ISE_2', 'C8000_2 - 2_ISE_1', mastercobas)}
+
+  mastermeans <- current_db[, .(Mean=mean(Result, na.rm=T),
+                                'CV(%)'=sd(Result)/mean(Result)*100,
+                                SD=sd(Result, na.rm=T)), .(Instrument, Control)][order(Instrument, Control)]
+  
+  mastermeans[Control_levels, on='Control', kontrolSD:=i.SD ]
+  mastermeans[Control_levels, on='Control', cvmaxkontrol:=as.numeric(i.cvmaxkontrol)]
+  
+  mastermeans[, Diff_mastermean:=(Mean[Instrument==mastercobas]-Mean), Control]
+  mastermeans[, Diff_SD:=Diff_mastermean/kontrolSD]
+  mastermeans[`CV(%)`==0, Diff_SD:=0]
+  cols=colnames(mastermeans)[3:9]
+  mastermeans[, (cols) := lapply(.SD, round,2), .SDcols = cols] 
+  
+  dt <- mastermeans[,-(5:6)]
+  
+  setnames(dt, old='CV(%)', new='CV')
+  setnames(dt, old='cvmaxkontrol', new='CVmax')
+
+  dt[, Test:=currenttest]
+  if (!exists('forsumtable')) {
+    forsumtable <- dt[0]}
+  
+  forsumtable <- rbind(forsumtable, dt[(CV > CVmax) | (abs(Diff_SD)>1.5),])
+  
+}
+
+dt <- forsumtable
+setcolorder(dt, c("Test", "Instrument", "Control", 'CV', 'CVmax', 'Diff_SD'))
+
+
+tableforpdf <- dt[,1:6] %>%
+  kbl() %>%
+  kable_styling("striped", full_width = F, position = "left") %>%
+  column_spec(6, background = ifelse(abs(dt$Diff_SD) > 1.5, "red", 'white')) %>%
+  column_spec(6, color = ifelse(abs(dt$Diff_SD) > 1.5, "white", 'black')) %>%
+  column_spec(6, bold = ifelse(abs(dt$Diff_SD) > 1.5, "T", 'F')) %>% 
+  column_spec(4, background = ifelse(dt$CV > dt$CVmax, "red", 'white')) %>%
+  column_spec(4, color = ifelse(dt$CV > dt$CVmax, "white", 'black')) %>%
+  column_spec(4, bold = ifelse(dt$CV > dt$CVmax, "T", 'F')) %>%    
+  row_spec(which(dt$Instrument==mastercobas), background = "#CCFFCC") %>%
+  row_spec(0, bold=T, background = "#D3D3D3")
+
+tableforpdf
+
+
+```
+
+
+Time period: from `r as.Date(min(current_db$Date))` to `r as.Date(max(current_db$Date))`.
